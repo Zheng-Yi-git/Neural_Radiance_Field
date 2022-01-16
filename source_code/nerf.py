@@ -201,43 +201,29 @@ def hierarchical_sampling(bins, weights, N_samples, det=False, pytest=False):
     weights = weights + 1e-5    ### to prevent nans
     pdf = weights / torch.sum(weights, -1, keepdim=True) # to normalize PDF
     cdf = torch.cumsum(pdf, -1)
-    cdf = torch.cat([torch.zeros_like(cdf[...,:1]), cdf], -1)  # (batch, len(bins))
+    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)  # (batch, len(bins))
 
     # below is to take uniform samples
     if det:
-        u = torch.linspace(0., 1., steps=N_samples)
+        u = torch.linspace(0., 1., steps = N_samples)
         u = u.expand(list(cdf.shape[:-1]) + [N_samples])
     else:
         u = torch.rand(list(cdf.shape[:-1]) + [N_samples])
 
-    # Pytest, overwrite u with numpy's fixed random numbers
-    if pytest:
-        np.random.seed(0)
-        new_shape = list(cdf.shape[:-1]) + [N_samples]
-        if det:
-            u = np.linspace(0., 1., N_samples)
-            u = np.broadcast_to(u, new_shape)
-        else:
-            u = np.random.rand(*new_shape)
-        u = torch.Tensor(u)
-
-    # Invert CDF
+    # below is to invert CDF
     u = u.contiguous()
-    inds = torch.searchsorted(cdf, u, right=True)
-    below = torch.max(torch.zeros_like(inds-1), inds-1)
-    above = torch.min((cdf.shape[-1]-1) * torch.ones_like(inds), inds)
+    inds = torch.searchsorted(cdf, u, right=True)                             # find the right place of u in CDF
+    below = torch.max(torch.zeros_like(inds - 1), inds - 1)
+    above = torch.min((cdf.shape[-1] - 1) * torch.ones_like(inds), inds)
     # print("below:", below, "above:", above)
     # print(below.shape)
-    inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)
-
-    matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
-    cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
-    bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
-
-    denom = (cdf_g[...,1]-cdf_g[...,0])
-    # print("denom:", denom)
-    denom = torch.where(denom<1e-5, torch.ones_like(denom), denom)
-    t = (u-cdf_g[...,0])/denom
-    samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
-
-    return samples
+    Inds = torch.stack([below, above], -1)  # (batch, N_samples, 2)
+    right_shape = [Inds.shape[0], Inds.shape[1], cdf.shape[-1]]
+    shaped_cdf = torch.gather(cdf.unsqueeze(1).expand(right_shape), 2, Inds)
+    shaped_bins = torch.gather(bins.unsqueeze(1).expand(right_shape), 2, Inds)
+    tmp = (shaped_cdf[..., 1] - shaped_cdf[..., 0])
+    # print("tmp:", tmp)
+    tmp = torch.where(tmp < 1e-5, torch.ones_like(tmp), tmp)
+    t = (u - shaped_cdf[..., 0]) / tmp
+    sample = shaped_bins[..., 0] + t * (shaped_bins[..., 1] - shaped_bins[..., 0])
+    return sample

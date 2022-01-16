@@ -80,6 +80,7 @@ def load_blender_data(basedir, half_res=False, testskip=1):
         counts.append(counts[-1] + imgs.shape[0])
         all_imgs.append(imgs)
         all_poses.append(poses)
+        #  -----------------------------------------------------for contour optimization------------------------------------------------
         if s == 'train':
             sub_imgs = (np.array(sub_imgs) / 255.).astype(np.float32)   #(imgs.shape[0], H, W, 3)
             all_sub_imgs = sub_imgs
@@ -104,7 +105,7 @@ def load_blender_data(basedir, half_res=False, testskip=1):
         outside_coords[zeros[i][0]].append([zeros[i][1], zeros[i][2]])
     # inside_coords = torch.Tensor(inside_coords)
     # print("outside:", len(outside_coords[16]))
-    
+    #  -----------------------------------------------------for contour optimization------------------------------------------------
     i_split = [np.arange(counts[i], counts[i+1]) for i in range(3)]
     
     imgs = np.concatenate(all_imgs, 0)
