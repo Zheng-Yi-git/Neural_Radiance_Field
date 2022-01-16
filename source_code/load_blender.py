@@ -1,4 +1,5 @@
 import os
+from re import L
 import torch
 import numpy as np
 import imageio 
@@ -44,10 +45,12 @@ def load_blender_data(basedir, half_res=False, testskip=1):
     all_imgs = []
     all_poses = []
     counts = [0]
+    all_sub_imgs = []
     for s in splits:
         meta = metas[s]
         imgs = []
         poses = []
+        sub_imgs = []
         if s=='train' or testskip==0:
             skip = 1
         else:
@@ -56,19 +59,51 @@ def load_blender_data(basedir, half_res=False, testskip=1):
         for frame in meta['frames'][::skip]:
             if frame['file_path'][-4:] == '.png':
                 fname = os.path.join(basedir, frame['file_path'])
+                sub_fname = os.path.join(basedir, frame['file_path'][:-4] + '_mask.png')    # for contour optimization
             else:    
                 fname = os.path.join(basedir, frame['file_path'] + '.png')
+                sub_fname = os.path.join(basedir, frame['file_path'] + '_mask.png')         # for contour optimization
             if os.path.exists(fname):
                 imgs.append(imageio.imread(fname))
             else:
                 # magic code
                 imgs.append(imageio.imread('data/nerf_synthetic/multihuman/render/000.png'))
+            
+            # for contour optimization
+            if os.path.exists(sub_fname):
+                sub_imgs.append(imageio.imread(sub_fname))
+            else:
+                sub_imgs.append(imageio.imread('data/nerf_synthetic/multihuman/render/000_mask.png'))
             poses.append(np.array(frame['transform_matrix']))
-        imgs = (np.array(imgs) / 255.).astype(np.float32) # keep all 4 channels (RGBA)
+        imgs = (np.array(imgs) / 255.).astype(np.float32) # keep all 4 channels (RGBA), stack all the img_info together
         poses = np.array(poses).astype(np.float32)
         counts.append(counts[-1] + imgs.shape[0])
         all_imgs.append(imgs)
         all_poses.append(poses)
+        if s == 'train':
+            sub_imgs = (np.array(sub_imgs) / 255.).astype(np.float32)   #(imgs.shape[0], H, W, 3)
+            all_sub_imgs = sub_imgs
+
+    No, h, w, three = np.nonzero(all_sub_imgs)
+    No_, h_, w_, three_ = np.where(all_sub_imgs==0)
+    # print(np.where(all_sub_imgs==0))
+    non_zero = []
+    zeros = []
+    inside_coords = []   # (counts[1], ..., 2)
+    outside_coords = []
+    for i in range (0, counts[1]):
+        inside_coords.append([])
+        outside_coords.append([])
+    for i in range (0, len(No), 3):
+        non_zero.append([No[i], h[i], w[i]])
+    for i in range (0, len(No_), 3):
+        zeros.append([No_[i], h_[i], w_[i]])
+    for i in range (0, len(non_zero)):
+        inside_coords[non_zero[i][0]].append([non_zero[i][1], non_zero[i][2]])
+    for i in range (0, len(zeros)):
+        outside_coords[zeros[i][0]].append([zeros[i][1], zeros[i][2]])
+    # inside_coords = torch.Tensor(inside_coords)
+    # print("outside:", len(outside_coords[16]))
     
     i_split = [np.arange(counts[i], counts[i+1]) for i in range(3)]
     
@@ -96,6 +131,6 @@ def load_blender_data(basedir, half_res=False, testskip=1):
         # imgs = tf.image.resize_area(imgs, [400, 400]).numpy()
 
         
-    return imgs, poses, render_poses, [H, W, focal], i_split
+    return imgs, poses, render_poses, [H, W, focal], i_split, inside_coords, outside_coords
 
 

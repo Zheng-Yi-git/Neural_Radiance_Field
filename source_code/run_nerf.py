@@ -191,6 +191,14 @@ def create_nerf(args):
 
     model_fine = None
 
+    ###
+    if args.N_importance > 0:
+        model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
+                          input_ch=input_ch, output_ch=output_ch, skips=skips,
+                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+        grad_vars += list(model_fine.parameters())
+    ###
+
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
@@ -276,7 +284,12 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     noise = 0.
     if raw_noise_std > 0.:
         noise = torch.randn(raw[...,3].shape) * raw_noise_std
-
+        ###Overwrite randomly sampled data if pytest
+        if pytest:
+            np.random.seed(0)
+            noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
+            noise = torch.Tensor(noise)
+        ###
     alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
@@ -354,6 +367,12 @@ def render_rays(ray_batch,
         lower = torch.cat([z_vals[...,:1], mids], -1)
         # stratified samples in those intervals
         t_rand = torch.rand(z_vals.shape)
+        ### Pytest, overwrite u with numpy's fixed random numbers
+        if pytest:
+            np.random.seed(0)
+            t_rand = np.random.rand(*list(z_vals.shape))
+            t_rand = torch.Tensor(t_rand)
+        ###
 
         z_vals = lower + (upper - lower) * t_rand
 
@@ -368,10 +387,29 @@ def render_rays(ray_batch,
         # fine part
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
 
+        ### hierarchical sampling method
+        z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+        z_samples = hierarchical_sampling(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
+        z_samples = z_samples.detach()
+
+        z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
+        pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None]        # [N_rays, N_samples + N_importance, 3]
+
+        selected_network = network_fn if network_fine is None else network_fine   # choose network
+        raw = network_query_fn(pts, viewdirs, selected_network)
+
+        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+        ### ----------------------------------------------------------------------------------------
     ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
     if retraw:
         ret['raw'] = raw
-
+    ###
+    if N_importance > 0:
+        ret['rgb0'] = rgb_map_0
+        ret['disp0'] = disp_map_0
+        ret['acc0'] = acc_map_0
+        ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
+    ###
     for k in ret:
         if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
             print(f"! [Numerical Error] {k} contains nan or inf.")
@@ -497,7 +535,7 @@ def train():
     parser = config_parser()
     args = parser.parse_args()
 
-    images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir)
+    images, poses, render_poses, hwf, i_split, inside_coords, outside_coords = load_blender_data(args.datadir)
     print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
     i_train, i_val, i_test = i_split
 
@@ -599,8 +637,8 @@ def train():
     print('VAL views are', i_val)
 
     # Summary writers
-    # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
-    
+    writer = SummaryWriter(os.path.join(basedir, 'summaries', expname), flush_secs=30)
+
     start = start + 1
     for i in trange(start, N_iters):
         time0 = time.time()
@@ -624,14 +662,29 @@ def train():
             img_i = np.random.choice(i_train)
             target = images[img_i]
             pose = poses[img_i, :3,:4]
-
+            inside = inside_coords[img_i]
+            outside = outside_coords[img_i]
+            # inside = torch.Tensor(inside)
+            # print("shape1:",projection.shape)
+            
             if N_rand is not None:
                 rays_o, rays_d = get_rays(H, W, focal, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
 
-                coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
-                coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
-                select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
-                select_coords = coords[select_inds].long()  # (N_rand, 2)
+                # coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
+                # coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+                # to set inside and outside
+                inside = torch.Tensor(inside)
+                outside = torch.Tensor(outside)
+                # print("inside_shape:", inside.shape,"out:",outside.shape)
+                
+                select_inds_inside = np.random.choice(inside.shape[0], size = [int(N_rand * 0.8)], replace = False)                 #more inside rays
+                select_inds_outside = np.random.choice(outside.shape[0], size = [int(np.ceil(N_rand * 0.2))], replace = False)      #less outside rays
+                # select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
+                # select_coords = coords[select_inds].long()  # (N_rand, 2)
+                select_coords_inside = inside[select_inds_inside].long()
+                select_coords_outside = outside[select_inds_outside].long()
+                select_coords = torch.cat((select_coords_inside, select_coords_outside), 0)
+                # print(select_coords.shape)
                 rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 batch_rays = torch.stack([rays_o, rays_d], 0)
@@ -640,7 +693,7 @@ def train():
         #####  Core optimization loop  #####
         rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
-                                                **render_kwargs_train)
+                                                **render_kwargs_train)  
 
         optimizer.zero_grad()
         img_loss = img2mse(rgb, target_s)
@@ -670,19 +723,20 @@ def train():
             torch.save({
                 'global_step': global_step,
                 'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
+                #'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
             }, path)
             print('Saved checkpoints at', path)
 
         if i%args.i_video==0 and i > 0:
-            pass
+            # pass
             # Turn on testing mode
-            # with torch.no_grad():
-            #     rgbs, disps = render_path(render_poses, hwf, args.chunk, render_kwargs_test)
-            # print('Done, saving', rgbs.shape, disps.shape)
-            # moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
-            # imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
-            # imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
+            with torch.no_grad():
+                rgbs, disps = render_path(render_poses, hwf, args.chunk, render_kwargs_test)
+            print('Done, saving', rgbs.shape, disps.shape)
+            moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
+            imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
+            imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
 
             # if args.use_viewdirs:
             #     render_kwargs_test['c2w_staticcam'] = render_poses[0][:3,:4]
@@ -692,18 +746,21 @@ def train():
             #     imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
 
         if i%args.i_testset==0 and i > 0:
-            pass
-            # testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
-            # os.makedirs(testsavedir, exist_ok=True)
-            # print('test poses shape', poses[i_test].shape)
-            # with torch.no_grad():
-            #     render_path(torch.Tensor(poses[i_test]).to(device), hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
-            # print('Saved test set')
+            # pass
+            testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
+            os.makedirs(testsavedir, exist_ok=True)
+            print('test poses shape', poses[i_test].shape)
+            with torch.no_grad():
+                render_path(torch.Tensor(poses[i_test]).to(device), hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+            print('Saved test set')
 
 
     
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+            # to display the training curve
+            writer.add_scalar('Train_loss', loss.item(), global_step)
+            writer.add_scalar('Learning_Rate', new_lrate, global_step)
         """
             print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
             print('iter time {:.05f}'.format(dt))
